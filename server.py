@@ -8,8 +8,10 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import RLock
+from urllib.parse import parse_qs, urlsplit
 
 from playlist import Playlist
+from music_search import MusicSearch, CatalogUnavailable
 
 ROOT = Path(__file__).resolve().parent
 
@@ -103,6 +105,7 @@ class Dashboard:
 
 def make_handler(dashboard):
     lock = RLock()
+    catalog = MusicSearch()
     external_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
     hosted = os.environ.get("RENDER") == "true"
 
@@ -119,7 +122,7 @@ def make_handler(dashboard):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' blob:; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' blob: https://*.itunes.apple.com https://*.mzstatic.com; img-src 'self' data: https://*.mzstatic.com; object-src 'none'; frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
 
@@ -138,6 +141,15 @@ def make_handler(dashboard):
                 return self.reply(200, {"status": "ok"})
             if not self.trusted():
                 return self.reply(403, {"error": "Untrusted host or origin."})
+            if urlsplit(self.path).path == "/api/search":
+                params = parse_qs(urlsplit(self.path).query)
+                try:
+                    result = catalog.search(params.get("q", [""])[0], params.get("country", ["US"])[0])
+                    return self.reply(200, result)
+                except ValueError as error:
+                    return self.reply(400, {"error": str(error)})
+                except CatalogUnavailable as error:
+                    return self.reply(503, {"error": str(error)})
             if self.path in ("/api/state", "/api/state?backward=1"):
                 with lock:
                     state = dashboard.state("backward=1" in self.path)
@@ -146,6 +158,8 @@ def make_handler(dashboard):
                 return self.reply(200, state)
             assets = {"/": ("index.html", "text/html; charset=utf-8"),
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                      "/discover.js": ("discover.js", "text/javascript; charset=utf-8"),
+                      "/itunes-badge.svg": ("itunes-badge.svg", "image/svg+xml"),
                       "/style.css": ("style.css", "text/css; charset=utf-8")}
             if self.path not in assets:
                 return self.reply(404, {"error": "Not found."})

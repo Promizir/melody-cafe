@@ -10,6 +10,54 @@ from urllib.request import Request, urlopen
 from http.server import HTTPServer, ThreadingHTTPServer
 
 from server import Dashboard, make_handler
+from music_search import MusicSearch, CatalogUnavailable, apple_url
+import io
+from urllib.error import URLError
+
+
+class MusicSearchTests(unittest.TestCase):
+    def test_results_and_cache(self):
+        source = {'results': [
+            {'kind': 'song', 'trackId': 1, 'trackName': 'Test Song', 'artistName': 'Artist',
+             'trackViewUrl': 'https://music.apple.com/us/album/test/1',
+             'previewUrl': 'https://audio-ssl.itunes.apple.com/test.m4a',
+             'artworkUrl100': 'https://is1-ssl.mzstatic.com/test.jpg'},
+            {'kind': 'song', 'trackId': 2, 'trackViewUrl': 'https://itunes.apple.com/us/test'},
+            {'kind': 'song', 'trackViewUrl': 'javascript:alert(1)'},
+            {'kind': 'music-video'}]}
+        client = MusicSearch()
+        with patch('music_search.urlopen', return_value=io.BytesIO(json.dumps(source).encode())) as fetch:
+            data = client.search('Test Song', 'AE')
+            self.assertEqual(len(data['results']), 2)
+            self.assertTrue(data['results'][0]['audio'].endswith('.m4a'))
+            self.assertEqual(data['results'][1]['audio'], '')
+            self.assertIs(client.search('  test  song ', 'AE'), data)
+            self.assertEqual(fetch.call_count, 1)
+            self.assertIn('country=AE', fetch.call_args.args[0].full_url)
+
+    def test_validation_errors_limits_and_bad_urls(self):
+        client = MusicSearch()
+        for term in ('', 'a', 'x' * 101):
+            with self.assertRaises(ValueError):
+                client.search(term)
+        with self.assertRaises(ValueError):
+            client.search('Song', 'XX')
+        with patch('music_search.urlopen', side_effect=URLError('offline')):
+            with self.assertRaises(CatalogUnavailable):
+                client.search('Song')
+        client.calls = [__import__('time').monotonic()] * 18
+        with self.assertRaises(CatalogUnavailable):
+            client.search('Another song')
+        self.assertEqual(apple_url('https://audio.itunes.apple.com.evil.com/a'), '')
+        self.assertEqual(apple_url('http://audio.itunes.apple.com/a'), '')
+        self.assertEqual(apple_url('https://evil.com/a', store=True), '')
+
+    def test_empty_and_malformed_responses(self):
+        with patch('music_search.urlopen', return_value=io.BytesIO(b'{"results":[]}')):
+            self.assertEqual(MusicSearch().search('Nothing')['results'], [])
+        with patch('music_search.urlopen', return_value=io.BytesIO(b'not JSON')):
+            with self.assertRaises(CatalogUnavailable):
+                MusicSearch().search('Something')
 
 
 class DashboardTests(unittest.TestCase):
@@ -76,10 +124,18 @@ class DashboardTests(unittest.TestCase):
         thread.start()
         base = f'http://127.0.0.1:{server.server_port}'
         try:
-            for route in ('/', '/app.js', '/style.css', '/api/state', '/api/state?backward=1'):
+            for route in ('/', '/app.js', '/discover.js', '/itunes-badge.svg', '/style.css', '/api/state', '/api/state?backward=1'):
                 with urlopen(base + route) as response:
                     self.assertEqual(response.status, 200)
                     self.assertTrue(response.read())
+            with patch('server.MusicSearch.search', return_value={'results': [], 'country': 'US'}):
+                with urlopen(base + '/api/search?q=test') as response:
+                    self.assertEqual(json.load(response)['results'], [])
+            with urlopen(base + '/style.css') as response:
+                self.assertIn('https://*.itunes.apple.com', response.headers['Content-Security-Policy'])
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(base + '/api/search?q=x')
+            self.assertEqual(caught.exception.code, 400)
             request = Request(base + '/api/action', data=json.dumps(dict(action='add', title='<script>test</script>', duration=20)).encode(), headers={'Content-Type': 'application/json'})
             with urlopen(request) as response:
                 self.assertEqual(response.status, 200)
